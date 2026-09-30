@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------------
+# LayerMem
+# ---------------------------------------------------------------------------
+
+# Virtualenvs. Both are reproducible from pyproject.toml + mlx-lm, and together
+# they are ~1.7 GB.
+.venv/
+.venv-serve/
+
+# Downloaded model weights (~3.8 GB for Qwen3-1.7B).
+# Re-fetch with: python scripts/fetch_model.py Qwen/Qwen3-1.7B models/Qwen3-1.7B
+models/
+
+# ---------------------------------------------------------------------------
+# Build artifacts
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Experiment output
+# ---------------------------------------------------------------------------
+# Qdrant stores, search results and evaluation files. The toolkit writes these
+# under memory_toolkits/<LayerMem_...>/ because the "filename" embeds the
+# model path. Rebuild with ./run_layermem_locomo.sh
+memory_toolkits/LayerMem_*/
+memory_toolkits/vector_store/
+memory_toolkits/token_cost*.json
+memory_toolkits/*_logs/
+
+# Default Qdrant location from LayerMemConfig.
+data/
+
+# Query logs and nohup output.
+*.log
+nohup.out
+
+# Note: the trailing slash above makes `LayerMem_*/` match directories only, so
+# the curated memory_toolkits/LayerMem_conv0_questions.md (a file) is tracked.
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+# LoCoMo is third-party data (ACL 2024, snap-research/locomo) — fetch it rather
+# than vendoring a copy. See LayerMem_results.md §七.
+benchmarks/locomo/*.json
+benchmarks/longmemeval/*.json
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.DS_Store
+.idea/
+*.swp
+*~

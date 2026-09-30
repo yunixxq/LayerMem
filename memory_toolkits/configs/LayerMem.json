@@ -1,0 +1,28 @@
+{
+  "user_id": "dummy",
+
+  "llm_backend": "openai",
+  "llm_model": "/Users/lyx/Projects/AgentMemory/LayerMem/models/Qwen3-1.7B",
+  "llm_base_url": "http://127.0.0.1:8080/v1",
+  "llm_api_key": "local",
+  "llm_max_tokens": 1024,
+  "llm_temperature": 0.0,
+
+  "retriever_name_or_path": "all-MiniLM-L6-v2",
+  "embedding_model_dims": 384,
+  "use_gpu": "cpu",
+
+  "buffer_turn_threshold": 10,
+  "buffer_token_threshold": 4096,
+
+  "theta_cluster": 0.75,
+  "theta_dup": 0.92,
+  "theta_confirm": 0.90,
+  "theta_retrieval": 0.6,
+
+  "K1": 5,
+  "K2": 5,
+  "K3": 3,
+
+  "top_k": 10
+}
