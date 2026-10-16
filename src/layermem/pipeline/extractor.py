@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from layermem.configs.config import LayerMemConfig
-from layermem.core.schema import Entry, iso_to_ts, now_ts
+from layermem.core.schema import ClusteredEntry, Entry, StateEntry, normalize_time
 from layermem.pipeline.buffer import Message
 
 logger = logging.getLogger(__name__)
@@ -30,23 +30,16 @@ class Extractor:
     def extract(
         self,
         batch: List[Message],
-        fallback_time: Optional[float] = None,
     ) -> Dict[str, List[Entry]]:
         if not batch:
             return {"factual": [], "relational": [], "state": []}
 
-        mention_ts = fallback_time or self._batch_time(batch) or now_ts()
-        session_id = self._session_id(batch)
         raw = self._extract_with_retry(batch)
 
-        if raw is None:
-            logger.warning("extraction failed twice; storing the batch verbatim")
-            return self._verbatim_fallback(batch, mention_ts, session_id)
-
         result = {
-            "factual": self._factual_atoms(raw.get("factual") or [], mention_ts, session_id),
-            "relational": self._relational_atoms(raw.get("relational") or [], mention_ts, session_id),
-            "state": self._state_atoms(raw.get("state") or [], mention_ts, session_id),
+            "factual": self._factual_atoms(raw.get("factual") or []),
+            "relational": self._relational_atoms(raw.get("relational") or []),
+            "state": self._state_atoms(raw.get("state") or []),
         }
         logger.debug(
             "extracted factual=%d relational=%d state=%d",
@@ -56,122 +49,85 @@ class Extractor:
         )
         return result
 
-    def _extract_with_retry(self, batch: List[Message]) -> Optional[Dict[str, Any]]:
-        """One retry, because a small local model intermittently emits
-        malformed JSON on an otherwise fine prompt."""
+    def _extract_with_retry(self, batch: List[Message]) -> Dict[str, Any]:
         for attempt in (1, 2):
             try:
                 return self.llm.extract_memories(batch)
             except Exception as exc:
+                if attempt == 2:
+                    raise RuntimeError("LLM memory extraction failed after two attempts") from exc
                 logger.warning("extraction attempt %d failed: %s", attempt, exc)
-        return None
-
-    def _verbatim_fallback(
-        self, batch: List[Message], mention_ts: float, session_id: Optional[str]
-    ) -> Dict[str, List[Entry]]:
-        text = " ".join(
-            f"{m.get('speaker_name') or m.get('role', 'user')}: {m.get('content', '')}".strip()
-            for m in batch
-            if str(m.get("content", "")).strip()
-        )
-        entry = Entry(
-            entry_type="factual",
-            layer="L1",
-            memory=text[:4000],
-            float_mention_time=mention_ts,
-            float_event_time=mention_ts,
-            source_dialog_ids=self._provenance(session_id),
-        )
-        return {"factual": [entry], "relational": [], "state": []}
-
-    # -------------------------------------------------------------- helpers
 
     @staticmethod
-    def _batch_time(batch: List[Message]) -> Optional[float]:
-        stamps = [iso_to_ts(m.get("timestamp")) for m in batch]
-        stamps = [s for s in stamps if s is not None]
-        return max(stamps) if stamps else None
+    def _parse_time(value: Any) -> Optional[str]:
+        try:
+            return normalize_time(value)
+        except (ValueError, OverflowError, OSError):
+            return None
 
-    @staticmethod
-    def _session_id(batch: List[Message]) -> Optional[str]:
-        for message in batch:
-            session_id = message.get("session_id")
-            if session_id:
-                return str(session_id)
-        return None
+    def _time_metadata(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        mention = self._parse_time(item.get("mention_time"))
+        if mention is None:
+            return None
+        event_value = _clean(item.get("event_time"))
+        event = self._parse_time(event_value)
+        if event_value is not None and event is None:
+            raise ValueError("Invalid event_time; use ISO-8601 or null")
+        metadata = {"event_time": event or mention}
+        if mention is not None:
+            metadata["mention_time"] = mention
+        return metadata
 
-    def _times(self, item: Dict[str, Any], mention_ts: float) -> Dict[str, Any]:
-        event = iso_to_ts(_clean(item.get("event_time"))) or mention_ts
-        return {"float_mention_time": mention_ts, "float_event_time": event}
-
-    def _provenance(self, session_id: Optional[str]) -> List[str]:
-        return [session_id] if session_id else []
-
-    def _factual_atoms(
-        self, items: List[Any], mention_ts: float, session_id: Optional[str]
-    ) -> List[Entry]:
-        atoms = []
+    def _clustered_atoms(
+        self,
+        items: List[str],
+        entry_type: Literal["factual", "relational"],
+    ) -> List[ClusteredEntry]:
+        atoms: List[ClusteredEntry] = []
         for item in items:
-            if not isinstance(item, dict):
+            if not isinstance(item, str):
                 continue
-            memory = _clean(item.get("memory"))
-            if not memory:
+            memory = _clean(item)
+            if memory is None:
                 continue
             atoms.append(
-                Entry(
-                    entry_type="factual",
+                ClusteredEntry(
+                    entry_type=entry_type,
                     layer="L1",
                     memory=memory,
-                    source_dialog_ids=self._provenance(session_id),
-                    **self._times(item, mention_ts),
                 )
             )
         return atoms
 
-    def _relational_atoms(
-        self, items: List[Any], mention_ts: float, session_id: Optional[str]
-    ) -> List[Entry]:
-        atoms = []
+    def _factual_atoms(self, items: List[str]) -> List[ClusteredEntry]:
+        return self._clustered_atoms(items, "factual")
+
+    def _relational_atoms(self, items: List[str]) -> List[ClusteredEntry]:
+        return self._clustered_atoms(items, "relational")
+
+    def _state_atoms(self, items: List[Dict[str, str]]) -> List[StateEntry]:
+        """Build state entries from the six-field state objects in the prompt."""
+        atoms: List[StateEntry] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
             memory = _clean(item.get("memory"))
-            if not memory:
-                continue
-            atoms.append(
-                Entry(
-                    entry_type="relational",
-                    layer="L1",
-                    memory=memory,   # 保持原始自然语言，不拼 entities
-                    source_dialog_ids=self._provenance(session_id),
-                    **self._times(item, mention_ts),
-                )
-            )
-        return atoms
-
-    def _state_atoms(
-        self, items: List[Any], mention_ts: float, session_id: Optional[str]
-    ) -> List[Entry]:
-        atoms = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
             subject = _clean(item.get("subject"))
             attribute = _clean(item.get("attribute"))
             value = _clean(item.get("value"))
-            if not (subject and attribute and value):
+            if not (memory and subject and attribute and value):
+                continue
+            time_metadata = self._time_metadata(item)
+            if time_metadata is None:
                 continue
             atoms.append(
-                Entry(
+                StateEntry(
                     entry_type="state",
-                    layer="L1",
-                    memory=f"{subject} — {attribute}: {value}",
+                    memory=memory,
                     subject=subject,
                     attribute=attribute.lower(),
                     value=value,
-                    status="current",
-                    source_dialog_ids=self._provenance(session_id),
-                    **self._times(item, mention_ts),
+                    **time_metadata,
                 )
             )
         return atoms

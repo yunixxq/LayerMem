@@ -8,8 +8,8 @@ The two kinds of track are fundamentally different and are treated as such:
   on. Their answer is a *ranked list*.
 * **state — "find what is correct".** No ANN at all: an exact lookup on the
   version chain, because at any point in time an attribute has exactly one
-  valid value. Its answer is a *value*, so it never competes on similarity and
-  is appended after the ranking instead of inside it.
+  valid value. Current, interval, and history results are appended after the
+  semantic ranking instead of competing on similarity.
 """
 
 from __future__ import annotations
@@ -19,8 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from layermem.configs.config import LayerMemConfig
-from layermem.core.schema import Entry, ts_to_iso
-from layermem.pipeline.normalizer import normalize_attribute
+from layermem.core.schema import Entry, StateEntry
 from layermem.retrieval.router import RetrievalPlan
 from layermem.storage.state_chain import StateChain
 from layermem.storage.vector_store import VectorStore
@@ -33,6 +32,7 @@ class RetrievalResult:
     memories: List[str] = field(default_factory=list)
     entries: List[Entry] = field(default_factory=list)
     state_entry: Optional[Entry] = None
+    state_entries: List[StateEntry] = field(default_factory=list)
     tracks_used: List[str] = field(default_factory=list)
 
 
@@ -51,11 +51,7 @@ class Retriever:
 
     def retrieve(self, query: str, plan: RetrievalPlan, k: Optional[int] = None) -> RetrievalResult:
         k = k or self.config.top_k
-        state_entry: Optional[Entry] = None
-        state_text: Optional[str] = None
-
-        if plan.wants_state:
-            state_entry, state_text = self._state_track(plan)
+        state_entries = self._state_track(plan) if plan.wants_state else []
 
         ranked: List[Tuple[Entry, float]] = []
         tracks_used: List[str] = []
@@ -70,15 +66,16 @@ class Retriever:
 
         entries = [e for e, _ in merged]
         texts = [_render(e) for e in entries]
-        if state_text:
-            entries.append(state_entry)  # type: ignore[arg-type]
-            texts.append(state_text)
+        if state_entries:
+            entries.extend(state_entries)
+            texts.extend(_render_state(entry) for entry in state_entries)
             tracks_used.append("state")
 
         return RetrievalResult(
             memories=texts,
             entries=entries,
-            state_entry=state_entry,
+            state_entry=state_entries[-1] if state_entries else None,
+            state_entries=state_entries,
             tracks_used=tracks_used,
         )
 
@@ -97,11 +94,8 @@ class Retriever:
         vector = self.embedder.embed(_embed_text(query, plan.keywords))
         candidate_pool = max(k * self.config.candidate_multiplier, 20)
 
-        # No status filter here on purpose: only state entries carry a status
-        # at all, so filtering on it would drop every factual/relational row
-        # (a Qdrant MatchExcept does not match documents lacking the field).
-        # Superseded state versions are excluded by the state track, which
-        # queries the chain directly instead of going through ANN.
+        # State versions are resolved by the state track, which queries the
+        # subject/attribute chain directly instead of going through ANN.
         dense_hits = self.store.search(
             vector,
             limit=candidate_pool,
@@ -126,41 +120,13 @@ class Retriever:
         ]
         return results[:candidate_pool]
 
-    def _state_track(self, plan: RetrievalPlan) -> Tuple[Optional[Entry], Optional[str]]:
-        attribute = normalize_attribute(plan.state_attr)
-        subject = plan.subject
-        if not attribute:
-            return None, None
-
-        if subject:
-            entry = self._lookup(subject, attribute, plan.target_ts)
-        else:
-            # The planner could not name a subject: answer for whichever
-            # subject actually has this attribute (LayerMem_imple.md §七.7).
-            entry = None
-            for candidate in self._subjects_for(attribute):
-                entry = self._lookup(candidate, attribute, plan.target_ts)
-                if entry is not None:
-                    break
-
-        if entry is None:
-            return None, None
-        return entry, _render_state(entry)
-
-    def _lookup(
-        self, subject: str, attribute: str, target_ts: Optional[float]
-    ) -> Optional[Entry]:
-        if target_ts is None:
-            return self.state_chain.get_current(subject, attribute)
-        return self.state_chain.get_at_time(subject, attribute, target_ts)
-
-    def _subjects_for(self, attribute: str) -> List[str]:
-        entries = self.store.scroll(limit=500, entry_type="state", attribute=attribute)
-        seen: List[str] = []
-        for entry in entries:
-            if entry.subject and entry.subject not in seen:
-                seen.append(entry.subject)
-        return seen
+    def _state_track(self, plan: RetrievalPlan) -> List[StateEntry]:
+        if not plan.subject or not plan.state_attr:
+            return []
+        upper = plan.time_upper if plan.time_upper is not None else plan.target_ts
+        return self.state_chain.query(
+            plan.subject, plan.state_attr, plan.query_type, plan.time_lower, upper,
+        )
 
     # -------------------------------------------------------------- fusion
 
@@ -209,7 +175,7 @@ def _mentions_any(text: str, keywords: Sequence[str]) -> bool:
 
 def _render(entry: Entry) -> str:
     """Format a memory for the answer prompt."""
-    stamp = (ts_to_iso(entry.float_event_time) or "")[:10]
+    stamp = (getattr(entry, "event_time", None) or "")[:10]
     prefix = f"{stamp}: " if stamp else ""
     if entry.layer in ("L2", "L3", "L4"):
         label = {"L2": "topic summary", "L3": "stage portrait", "L4": "profile"}[entry.layer]
@@ -217,7 +183,7 @@ def _render(entry: Entry) -> str:
     return f"{prefix}{entry.memory}"
 
 
-def _render_state(entry: Entry) -> str:
+def _render_state(entry: StateEntry) -> str:
     """State results are emitted as a complete time + subject + attribute + value."""
-    stamp = (ts_to_iso(entry.float_event_time) or "")[:10] or "unknown time"
-    return f"{stamp}, {entry.subject} {entry.attribute}: {entry.value}"
+    stamp = (entry.event_time or "")[:10] or "unknown time"
+    return f"{stamp}, {entry.subject} {entry.attribute}: {entry.value}. {entry.memory}"

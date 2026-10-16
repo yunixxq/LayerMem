@@ -1,26 +1,3 @@
-"""Qdrant wrapper: one collection **per perspective**, dense + sparse vectors.
-
-Collections
------------
-``<collection_name>_factual`` / ``_relational`` / ``_state``. Splitting by
-perspective means a query for one kind of memory only ever touches that
-kind's index: the state chain's exact ``(subject, attribute)`` lookups and a
-factual ANN scan never share a scan, and each collection can be tuned,
-re-indexed or dropped on its own. Within a collection the layer (L1-L4) stays
-a payload filter, so recall can still cross abstraction levels.
-
-Methods that name an ``entry_type`` address exactly one collection. Methods
-that do not fan out across all three and merge — see :meth:`_collections`.
-
-BM25 without a BM25 dependency
-------------------------------
-Each collection carries a sparse vector using Qdrant's ``Modifier.IDF``, so
-the server computes IDF and the client only sends *term frequencies*. A plain
-tokenizer plus a hashing trick is therefore enough: no vocabulary to persist,
-no extra model to download. Dense+sparse fusion runs server-side via
-``FusionQuery(RRF)``.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -29,20 +6,20 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from qdrant_client import QdrantClient, models
 
-from layermem.core.schema import ENTRY_TYPES, Entry
+from layermem.core.schema import Entry, entry_from_payload, normalize_time
 
 logger = logging.getLogger(__name__)
 
 DENSE = "dense"
 SPARSE = "sparse"
 
-# One collection per perspective; ``entry_type`` is implied by the collection
-# rather than filtered on.
-COLLECTIONS = ENTRY_TYPES
+# State nodes live in SQLite. The attribute index is managed separately and
+# never included in memory-vector queries.
+COLLECTIONS = ("factual", "relational")
 
 # Payload fields that get an index inside each collection. Without one,
 # Qdrant filters degrade to a full scan.
-INDEXED_FIELDS = ("layer", "topic_id", "subject", "attribute", "status")
+INDEXED_FIELDS = ("layer", "topic_id", "subject", "attribute")
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _STOPWORDS = frozenset(
@@ -77,7 +54,7 @@ def sparse_encode(text: str, dim: int) -> models.SparseVector:
 
 
 class VectorStore:
-    """Persistence for every :class:`Entry`, partitioned by perspective."""
+    """Vector persistence for factual/relational entries."""
 
     def __init__(
         self,
@@ -115,8 +92,8 @@ class VectorStore:
         """Collections a query must touch.
 
         Naming an ``entry_type`` is the fast path — one collection. Leaving it
-        out fans out across all three, which is occasionally needed (compaction
-        over a layer, ``get_by_id`` without knowing the type) but costs three
+        out fans out across both vector collections, which is needed for
+        cross-perspective scans or ``get_by_id`` without knowing the type, but costs two
         round trips.
         """
         if entry_type is not None:
@@ -196,8 +173,7 @@ class VectorStore:
     ) -> bool:
         """Patch a payload, in whichever perspective collection holds the id.
 
-        The state chain always knows its perspective and passes
-        ``entry_type="state"``; the clusterer does not and fans out.
+        A caller that knows the perspective can avoid searching both collections.
 
         Fanning out has a wrinkle worth knowing: Qdrant's *embedded* client
         raises ``KeyError`` when asked to patch a point that is not in that
@@ -208,6 +184,13 @@ class VectorStore:
         the caller passed an id that is not stored anywhere — usually a stale
         reference — and is worth surfacing rather than swallowing.
         """
+        patch = dict(patch)
+        for name in ("mention_time", "event_time"):
+            legacy = "float_" + name
+            if legacy in patch:
+                patch.setdefault(name, patch.pop(legacy))
+            if name in patch:
+                patch[name] = normalize_time(patch[name])
         for collection in self._collections(entry_type):
             try:
                 self.client.set_payload(
@@ -229,8 +212,6 @@ class VectorStore:
         topic_id: Optional[str] = None,
         subject: Optional[str] = None,
         attribute: Optional[str] = None,
-        status: Optional[str] = None,
-        exclude_status: Optional[str] = None,
     ) -> Optional[models.Filter]:
         def match(value):
             if isinstance(value, (list, tuple, set)):
@@ -246,14 +227,6 @@ class VectorStore:
             conditions.append(models.FieldCondition(key="subject", match=match(subject)))
         if attribute is not None:
             conditions.append(models.FieldCondition(key="attribute", match=match(attribute)))
-        if status is not None:
-            conditions.append(models.FieldCondition(key="status", match=match(status)))
-        if exclude_status is not None:
-            conditions.append(
-                models.FieldCondition(
-                    key="status", match=models.MatchExcept(**{"except": [exclude_status]})
-                )
-            )
         return models.Filter(must=conditions) if conditions else None
 
     @staticmethod
@@ -263,7 +236,7 @@ class VectorStore:
         # its default factory and hand back a fresh UUID, which would make
         # every later update_payload/delete target a row that does not exist.
         payload["id"] = str(point.id)
-        return Entry.from_payload(payload)
+        return entry_from_payload(payload)
 
     def search(
         self,
@@ -276,7 +249,7 @@ class VectorStore:
         """Dense-only ANN search.
 
         Cosine scores are comparable across collections, so an unfiltered
-        search simply merges all three by score.
+        search simply merges both vector collections by score.
         """
         query_filter = self._build_filter(**filters)
         hits: List[Tuple[Entry, float]] = []
@@ -369,12 +342,12 @@ class VectorStore:
         entry_type: Optional[str] = None,
         **filters: Any,
     ) -> List[Entry]:
-        """Exact filter, no ANN. Used by the state chain and the compressor.
+        """Exact filter, no ANN. Used by the clusterer and the compressor.
 
         ``limit`` is **per collection**, not a global cap. When this fans out,
         every perspective gets its own budget — otherwise one perspective with
         many matching rows would crowd the others out entirely, which is the
-        wrong default for the callers here (compaction and watermark scans
+        wrong default for cross-perspective scans
         want everything that matches).
         """
         query_filter = self._build_filter(**filters)

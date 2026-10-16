@@ -68,7 +68,7 @@ add(messages)            写入（进 buffer，达阈值自动 flush）
 flush()                  强制把 buffer 里的对话提取入库
 retrieve(query, k)       检索，返回记忆文本列表
 retrieve_detailed(query) 同上，但返回 RetrievalResult（含 tracks、entries）
-compact() / close() / stats()
+close() / stats()
 ```
 
 它是**纯库，没有 CLI**，必须由外部驱动——所以需要适配层。

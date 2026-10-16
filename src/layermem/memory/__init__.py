@@ -4,10 +4,9 @@ from .embedder import (
     EmbedderConfig,
     EmbedderFactory,
     TextEmbedderFactory,
-    TextEmbedderHuggingface,
     TextEmbedderOpenAI,
 )
-from .llm import LLMFactory, OpenAILLM, TransformersLLM
+from .llm import LLMFactory, OpenAILLM
 
 __all__ = [
     "EmbedderConfig",
@@ -15,7 +14,5 @@ __all__ = [
     "LLMFactory",
     "OpenAILLM",
     "TextEmbedderFactory",
-    "TextEmbedderHuggingface",
     "TextEmbedderOpenAI",
-    "TransformersLLM",
 ]

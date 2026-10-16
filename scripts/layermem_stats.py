@@ -16,6 +16,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from layermem.storage.vector_store import VectorStore  # noqa: E402
+from layermem.storage.state_chain import StateChain  # noqa: E402
+from layermem.storage.state_store import StateStore  # noqa: E402
 
 
 def main() -> int:
@@ -27,20 +29,24 @@ def main() -> int:
     by_type = Counter(e.entry_type for e in entries)
     topics = {e.topic_id for e in entries if e.topic_id}
 
-    states = [e for e in entries if e.entry_type == "state"]
-    current = [e for e in states if e.status == "current"]
-    superseded = [e for e in states if e.status == "superseded"]
-    attributes = Counter(f"{e.subject}/{e.attribute}" for e in states)
+    state_path = sys.argv[3] if len(sys.argv) > 3 else StateChain.default_db_path(qdrant_dir, collection)
+    nodes = StateStore(state_path)
+    attributes = {
+        f"{item['subject']}/{item['attribute']}": len(nodes.query(**item, query_type="all"))
+        for item in nodes.attributes()
+    }
+    state_count = nodes.count()
+    by_type["state"] = state_count
 
     report = {
-        "total_entries": len(entries),
+        "total_entries": len(entries) + state_count,
         "by_layer": dict(sorted(by_layer.items())),
         "by_type": dict(sorted(by_type.items())),
         "topics": len(topics),
         "state": {
-            "total": len(states),
-            "current": len(current),
-            "superseded": len(superseded),
+            "total": state_count,
+            "current": len(attributes),
+            "historical": state_count - len(attributes),
             "distinct_attributes": len(attributes),
             "attributes_with_history": sorted(
                 key for key, count in attributes.items() if count > 1
@@ -51,6 +57,7 @@ def main() -> int:
         },
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
+    nodes.close()
     store.close()
     return 0
 

@@ -20,6 +20,12 @@ class OpenAIClient(OpenAI):
     specified tolerance level if any errors occur during the API call.
     """
 
+    def __init__(self, *args, api_type: str = "chat_completions", **kwargs):
+        if api_type not in {"chat_completions", "responses"}:
+            raise ValueError(f"Unsupported API type: {api_type}")
+        super().__init__(*args, **kwargs)
+        self.api_type = api_type
+
     def get_text_generation_output(
         self, 
         messages: List[Dict[str, str]], 
@@ -42,15 +48,28 @@ class OpenAIClient(OpenAI):
 
         while response_content is None and counter <= max_tolerance:
             try:
-                response = self.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stream=stream,
-                    **kwargs
-                )
-                if stream:
+                if self.api_type == "responses":
+                    prompt = "\n\n".join(
+                        f"{m.get('role', 'user').upper()}:\n{m.get('content', '')}" for m in messages
+                    )
+                    response = self.responses.create(model=model, input=prompt)
+                    if getattr(response, "status", None) not in (None, "completed") or getattr(response, "error", None):
+                        raise ValueError("Responses request did not complete")
+                    content = response.output_text
+                    if not content or not content.strip():
+                        raise ValueError("Responses endpoint returned no output text")
+                else:
+                    response = self.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stream=stream,
+                        **kwargs
+                    )
+                if self.api_type == "responses":
+                    pass
+                elif stream:
                     chunks = []
                     reasoning_chunks = [] 
                     for chunk in response:
@@ -73,6 +92,8 @@ class OpenAIClient(OpenAI):
                     if hasattr(response.choices[0].message, "reasoning_content"):
                         reasoning_content = response.choices[0].message.reasoning_content 
             except Exception as e:
+                if self.api_type == "responses":
+                    raise
                 print(e)
             finally: 
                 response_content = content if post_processor is None else post_processor(content)

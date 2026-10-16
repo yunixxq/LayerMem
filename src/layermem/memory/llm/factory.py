@@ -3,13 +3,11 @@ from typing import Any, Dict, Mapping
 from layermem.configs.config import LLMConfig
 
 from .openai import OpenAILLM
-from .transformers import TransformersLLM
 
 
 class LLMFactory:
     _MODEL_MAPPING = {
         "openai": OpenAILLM,
-        "transformers": TransformersLLM,
     }
 
     @classmethod

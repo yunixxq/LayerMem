@@ -23,14 +23,11 @@ from layermem.memory.embedder import EmbedderFactory, TextEmbedderHuggingface
 from layermem.memory.llm import LLMFactory, OpenAILLM
 from layermem.memory.llm.utils import (
     conversation_text,
-    latest_timestamp,
     normalize_extraction,
     parse_json_object,
 )
 from layermem.prompts.extraction import (
     EXTRACTION_PROMPT,
-    MEMORY_EXTRACTION_PROMPT,
-    render_extraction_prompt,
 )
 
 # --------------------------------------------------------------------------
@@ -38,15 +35,13 @@ from layermem.prompts.extraction import (
 # --------------------------------------------------------------------------
 
 
-def test_prompt_fills_the_date_anchor():
-    rendered = render_extraction_prompt("2024-03-20")
-    assert "2024-03-20" in rendered
-    assert "{current_date}" not in rendered
+def test_prompt_uses_each_messages_timestamp():
+    assert "timestamp in brackets is the mention_time of that specific message" in EXTRACTION_PROMPT
+    assert "{current_date}" not in EXTRACTION_PROMPT
 
 
 def test_prompt_keeps_literal_json_braces():
-    """str.replace (not str.format) must leave the JSON examples intact."""
-    rendered = render_extraction_prompt("2024-03-20")
+    rendered = EXTRACTION_PROMPT
     assert '"factual": [' in rendered
     assert "{{" not in rendered
 
@@ -54,12 +49,7 @@ def test_prompt_keeps_literal_json_braces():
 def test_prompt_asks_only_for_event_time():
     assert "event_time" in EXTRACTION_PROMPT
     assert "ISO-8601" in EXTRACTION_PROMPT
-    assert "mention_time" not in EXTRACTION_PROMPT
-    assert MEMORY_EXTRACTION_PROMPT is EXTRACTION_PROMPT
-
-
-def test_prompt_without_a_date_still_renders():
-    assert "{current_date}" not in render_extraction_prompt(None)
+    assert '"mention_time":' not in EXTRACTION_PROMPT
 
 
 # --------------------------------------------------------------------------
@@ -76,13 +66,14 @@ def test_conversation_text_accepts_every_timestamp_spelling(time_key):
 def test_conversation_text_renders_unix_timestamps_as_iso():
     conversation = [{"role": "user", "content": "hi", "timestamp": 1710500000.0}]
     rendered = conversation_text(conversation)
-    assert rendered.startswith("[2024-03-15T")
+    assert rendered.startswith("[message 1] [2024-03-15T")
+    assert "+00:00]" in rendered
     assert "hi" in rendered
 
 
 def test_conversation_text_prefers_speaker_name_over_role():
     conversation = [{"role": "user", "speaker_name": "Alice", "content": "hi"}]
-    assert conversation_text(conversation) == "Alice: hi"
+    assert conversation_text(conversation) == "[message 1] Alice: hi"
 
 
 def test_conversation_text_skips_empty_turns():
@@ -96,16 +87,6 @@ def test_conversation_text_skips_empty_turns():
 
 def test_conversation_text_passes_raw_strings_through():
     assert conversation_text("raw dialogue") == "raw dialogue"
-
-
-def test_latest_timestamp_is_the_anchor():
-    conversation = [
-        {"role": "user", "content": "a", "timestamp": "2024-03-15T14:30:00"},
-        {"role": "user", "content": "b", "timestamp": "2024-03-16T09:00:00"},
-    ]
-    assert latest_timestamp(conversation) == "2024-03-16T09:00:00"
-    assert latest_timestamp([]) is None
-    assert latest_timestamp("raw") is None
 
 
 # --------------------------------------------------------------------------
@@ -271,18 +252,25 @@ def test_extract_memories_returns_three_lists_plus_meta():
     assert set(result) == {"factual", "relational", "state", "meta"}
     assert result["state"][0]["value"] == "Helsinki"
     assert result["meta"]["usage"]["total_tokens"] == 100
-    assert result["meta"]["current_date"] == "2024-03-15T14:30:00"
+    assert "current_date" not in result["meta"]
 
 
-def test_extract_memories_sends_timestamps_and_date_anchor_to_the_model():
+def test_extract_memories_preserves_each_messages_time_without_a_global_anchor():
     llm = OpenAILLM(LLMConfig(model="gpt-4o-mini", api_key="test"))
-    with patch.object(llm, "client") as client:
-        client.chat.completions.create.return_value = _fake_completion(VALID_PAYLOAD)
-        llm.extract_memories(CONVERSATION)
-
-    sent = client.chat.completions.create.call_args.kwargs
-    assert "2024-03-15T14:30:00" in sent["messages"][0]["content"]
-    assert "[2024-03-15T14:30:00] Alice: I moved to Helsinki" in sent["messages"][1]["content"]
+    conversation = CONVERSATION + [{
+        "role": "user", "speaker_name": "Bob", "content": "I arrived yesterday",
+        "timestamp": "2024-04-20T09:00:00", "session_id": "private-session-id",
+    }]
+    with patch.object(llm, "generate_response", return_value=(VALID_PAYLOAD, {})) as generate:
+        result = llm.extract_memories(conversation)
+    sent = generate.call_args.args[0]
+    assert sent[0]["role"] == "user"
+    assert EXTRACTION_PROMPT in sent[0]["content"]
+    assert "2024-03-15" not in sent[0]["content"][:len(EXTRACTION_PROMPT)]
+    assert "[2024-03-15T14:30:00] Alice: I moved to Helsinki" in sent[0]["content"]
+    assert "[2024-04-20T09:00:00] Bob: I arrived yesterday" in sent[0]["content"]
+    assert "private-session-id" not in sent[0]["content"]
+    assert "current_date" not in result["meta"]
 
 
 def test_extract_memories_retries_without_json_mode():
@@ -323,36 +311,70 @@ def test_llm_backend_imports_are_eager():
     assert not hasattr(sys.modules["layermem.memory.llm"], "_LAZY_BACKENDS")
 
 
-def test_transformers_backend_uses_dtype_and_a_real_device():
-    """transformers >= 4.56 renamed ``torch_dtype`` to ``dtype``.
+def test_llm_factory_rejects_removed_transformers_backend():
+    with pytest.raises(ValueError, match="Unsupported LLM backend"):
+        LLMFactory.from_config(LLMConfig(model_name="transformers"))
 
-    Loading is stubbed out — this only checks the arguments we send and the
-    device selection, not the model itself.
-    """
-    import torch
 
-    from layermem.memory.llm import transformers as backend
+def test_responses_request_and_extraction_through_sdk(monkeypatch):
+    import json
+    import httpx
+    from openai import OpenAI
 
-    captured = {}
+    monkeypatch.setenv("OPENAI_API_KEY", "test-relay-key")
+    llm = LLMFactory.from_config(LLMConfig(
+        api_type="responses", model="gpt-4o-mini", base_url="https://api.tokenlab.sh/v1",
+    ))
+    assert llm.client.api_key == "test-relay-key"
+    requests = []
 
-    def fake_from_pretrained(*args, **kwargs):
-        captured.update(kwargs)
-        return object()
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            "id": "resp_test", "object": "response", "created_at": 1,
+            "status": "completed", "model": "gpt-4o-mini",
+            "output": [{"id": "msg_test", "type": "message", "role": "assistant",
+                        "status": "completed", "content": [
+                            {"type": "output_text", "text": VALID_PAYLOAD, "annotations": []}
+                        ]}],
+            "usage": {"input_tokens": 70, "output_tokens": 30, "total_tokens": 100},
+        })
 
-    with patch.object(backend.AutoTokenizer, "from_pretrained", return_value=object()), patch.object(
-        backend.AutoModelForCausalLM, "from_pretrained", side_effect=fake_from_pretrained
-    ):
-        backend.TransformersLLM(LLMConfig(model="fake/model"))
+    llm.client.close()
+    with OpenAI(api_key="test-relay-key", base_url="https://api.tokenlab.sh/v1",
+                http_client=httpx.Client(transport=httpx.MockTransport(handle))) as client:
+        llm.client = client
+        result = llm.extract_memories(CONVERSATION)
+        text, _ = llm.generate_response([{"role": "user", "content": "Summarize memories"}])
+    assert len(requests) == 2
+    assert str(requests[0].url) == "https://api.tokenlab.sh/v1/responses"
+    assert requests[0].headers["authorization"] == "Bearer test-relay-key"
+    body = json.loads(requests[0].content)
+    assert set(body) == {"model", "input"}
+    assert body["model"] == "gpt-4o-mini"
+    assert body["input"] == EXTRACTION_PROMPT + "\n\n" + conversation_text(CONVERSATION)
+    assert json.loads(requests[1].content)["input"] == "Summarize memories"
+    assert result["state"][0]["value"] == "Helsinki"
+    assert result["meta"]["usage"] == {"prompt_tokens": 70, "completion_tokens": 30, "total_tokens": 100}
+    assert text == VALID_PAYLOAD
+    assert llm.get_stats() == {"total_calls": 2, "total_tokens": 200}
 
-    assert "torch_dtype" not in captured, "torch_dtype is deprecated in transformers>=4.56"
-    assert "dtype" in captured
 
-    if torch.cuda.is_available():
-        assert captured["device_map"] == "auto"
-    elif backend._mps_available():
-        assert captured["device_map"] == {"": "mps"}
-    else:
-        assert captured["device_map"] == {"": "cpu"}
+@pytest.mark.parametrize("status,text", [("incomplete", VALID_PAYLOAD), ("failed", ""), ("completed", "")])
+def test_responses_rejects_incomplete_or_empty_output(status, text):
+    llm = OpenAILLM(LLMConfig(api_type="responses", api_key="test"))
+    with patch.object(llm, "client") as client:
+        client.responses.create.return_value = types.SimpleNamespace(
+            status=status, output_text=text, error=None,
+        )
+        with pytest.raises(ValueError):
+            llm.extract_memories(CONVERSATION)
+        client.chat.completions.create.assert_not_called()
+
+
+def test_llm_rejects_unknown_api_type():
+    with pytest.raises(ValueError, match="Unsupported LLM API type"):
+        OpenAILLM(LLMConfig(api_type="typo"))
 
 
 # --------------------------------------------------------------------------
@@ -461,8 +483,7 @@ def test_time_reference_resolution():
     assert resolve_time_reference("2021", now) is not None
 
 
-def test_extractor_falls_back_to_verbatim_text_when_the_model_breaks():
-    """Losing a batch to a malformed JSON response is not acceptable."""
+def test_extractor_raises_when_the_model_breaks():
     from layermem.pipeline.extractor import Extractor
 
     class BrokenLLM:
@@ -473,9 +494,9 @@ def test_extractor_falls_back_to_verbatim_text_when_the_model_breaks():
         {"role": "user", "content": "I moved to Helsinki",
          "timestamp": "2024-03-15T14:30:00", "speaker_name": "Alice"},
     ]
-    atoms = Extractor(BrokenLLM()).extract(batch)
-    assert len(atoms["factual"]) == 1
-    assert "Helsinki" in atoms["factual"][0].memory
+    with pytest.raises(RuntimeError, match="failed after two attempts") as error:
+        Extractor(BrokenLLM()).extract(batch)
+    assert isinstance(error.value.__cause__, ValueError)
 
 
 def test_mention_time_comes_from_the_turn_not_the_model():
@@ -486,31 +507,32 @@ def test_mention_time_comes_from_the_turn_not_the_model():
         def extract_memories(self, conversation, **_):
             return {
                 "factual": [
-                    {"memory": "event in the past", "event_time": "2024-03-15T14:30:00"},
-                    {"memory": "no date given"},
+                    {"memory": "event in the past", "event_time": "2024-03-15T14:30:00", "source_message_id": 2},
+                    {"memory": "no date given", "source_message_id": 1},
                 ],
                 "relational": [],
                 "state": [
                     {"subject": "Alice", "attribute": "Residence", "value": "Helsinki",
-                     "event_time": "unknown"},
+                     "event_time": "unknown", "source_message_id": 1},
                 ],
             }
 
     batch = [
-        {"role": "user", "content": "x", "timestamp": "2024-01-01T00:00:00"},
-        {"role": "user", "content": "y", "timestamp": "2024-08-02T09:00:00"},
+        {"role": "user", "content": "x", "timestamp": "2024-01-01T00:00:00", "session_id": "s1"},
+        {"role": "user", "content": "y", "timestamp": "2024-08-02T09:00:00", "session_id": "s2"},
     ]
     atoms = Extractor(LLM()).extract(batch)
-    session_ts = iso_to_ts("2024-08-02T09:00:00")
+    session_ts = "2024-08-02T09:00:00.000000Z"
 
-    for entry in atoms["factual"] + atoms["state"]:
-        assert entry.float_mention_time == pytest.approx(session_ts)
+    assert atoms["factual"][0].mention_time == session_ts
+    assert atoms["factual"][0].source_dialog_ids == ["s2"]
+    for entry in [atoms["factual"][1], atoms["state"][0]]:
+        assert entry.mention_time == "2024-01-01T00:00:00.000000Z"
+        assert entry.source_dialog_ids == ["s1"]
 
-    assert atoms["factual"][0].float_event_time == pytest.approx(
-        iso_to_ts("2024-03-15T14:30:00")
-    )
-    assert atoms["factual"][1].float_event_time == pytest.approx(session_ts)
-    assert atoms["state"][0].float_event_time == pytest.approx(session_ts)
+    assert atoms["factual"][0].event_time == "2024-03-15T14:30:00.000000Z"
+    assert atoms["factual"][1].event_time == "2024-01-01T00:00:00.000000Z"
+    assert atoms["state"][0].event_time == "2024-01-01T00:00:00.000000Z"
     assert atoms["state"][0].attribute == "residence"
 
 
@@ -545,7 +567,7 @@ def test_state_chain_supersedes_and_answers_historically(store):
         ts = iso_to_ts(when)
         return Entry(entry_type="state", memory=f"Alice — residence: {value}",
                      subject="Alice", attribute="residence", value=value,
-                     float_event_time=ts, float_mention_time=ts)
+                     event_time=ts, mention_time=ts)
 
     jan = chain.handle(make("Hangzhou", "2024-01-10T10:00:00"))
     aug = chain.handle(make("Helsinki", "2024-08-02T09:00:00"))
@@ -555,6 +577,25 @@ def test_state_chain_supersedes_and_answers_historically(store):
     assert chain.get_current("Alice", "residence").value == "Helsinki"
     assert chain.get_at_time("Alice", "residence", iso_to_ts("2024-03-01T00:00:00")).value == "Hangzhou"
     assert store.count(entry_type="state", status="superseded") == 1
+
+
+def test_state_chain_orders_offsets_and_queries_iso_time(store):
+    from layermem.core.schema import Entry
+    from layermem.storage.state_chain import StateChain
+
+    class Embedder:
+        def embed(self, text):
+            return [1.0, 0.0, 0.0, 0.0]
+
+    chain = StateChain(store, Embedder())
+    for value, when in [("A", "2023-05-25T14:00:00+08:00"), ("B", "2023-05-25T07:00:00Z")]:
+        chain.handle(Entry(entry_type="state", memory=value, subject="Alice", attribute="residence",
+                           value=value, event_time=when))
+    assert chain.get_current("Alice", "residence").value == "B"
+    assert chain.get_at_time("Alice", "residence", "2023-05-25T14:30:00+08:00").value == "A"
+    current = chain.get_current("Alice", "residence")
+    store.update_payload(current.id, {"event_time": "2023-05-25T16:00:00+08:00"}, entry_type="state")
+    assert chain.get_current("Alice", "residence").event_time == "2023-05-25T08:00:00.000000Z"
 
 
 def test_state_chain_keeps_a_later_mentioned_earlier_period_as_history(store):
@@ -572,7 +613,7 @@ def test_state_chain_keeps_a_later_mentioned_earlier_period_as_history(store):
     def make(value, event, mention):
         return Entry(entry_type="state", memory=f"Alice — residence: {value}",
                      subject="Alice", attribute="residence", value=value,
-                     float_event_time=iso_to_ts(event), float_mention_time=iso_to_ts(mention))
+                     event_time=iso_to_ts(event), mention_time=iso_to_ts(mention))
 
     chain.handle(make("Helsinki", "2024-08-01T00:00:00", "2024-08-02T09:00:00"))
     # Mentioned later, but happened earlier.
@@ -607,8 +648,8 @@ def test_compression_does_not_re_summarise_the_same_atoms(store):
     for index in range(3):
         store.upsert(
             Entry(entry_type="factual", layer="L1", topic_id="t1", memory=f"fact {index}",
-                  float_event_time=iso_to_ts(f"2024-01-0{index + 1}T00:00:00"),
-                  float_mention_time=iso_to_ts(f"2024-01-0{index + 1}T00:00:00")),
+                  event_time=iso_to_ts(f"2024-01-0{index + 1}T00:00:00"),
+                  mention_time=iso_to_ts(f"2024-01-0{index + 1}T00:00:00")),
             [1.0, 0.0, 0.0, 0.0],
         )
 
@@ -642,7 +683,7 @@ def test_state_chain_prefers_update_over_confirm_for_similar_values(store):
         ts = iso_to_ts(when)
         return Entry(entry_type="state", memory=f"Alice — residence: {value}",
                      subject="Alice", attribute="residence", value=value,
-                     float_event_time=ts, float_mention_time=ts)
+                     event_time=ts, mention_time=ts)
 
     chain.handle(make("Hangzhou", "2024-01-10T10:00:00"))
     assert chain.handle(make("Helsinki", "2024-08-02T09:00:00")).action == "UPDATE"
@@ -664,7 +705,7 @@ def test_state_chain_confirms_a_restatement(store):
         ts = iso_to_ts(when)
         return Entry(entry_type="state", memory=f"Alice — residence: {value}",
                      subject="Alice", attribute="residence", value=value,
-                     float_event_time=ts, float_mention_time=ts)
+                     event_time=ts, mention_time=ts)
 
     chain.handle(make("Helsinki", "2024-08-02T09:00:00"))
     transition = chain.handle(make("Helsinki, Finland", "2024-09-02T09:00:00"))
@@ -672,9 +713,7 @@ def test_state_chain_confirms_a_restatement(store):
     assert transition.action == "CONFIRM"
     assert chain.get_current("Alice", "residence").value == "Helsinki"
     # Confirming is evidence the value still held later, so its event time moves.
-    assert chain.get_current("Alice", "residence").float_event_time == pytest.approx(
-        iso_to_ts("2024-09-02T09:00:00")
-    )
+    assert chain.get_current("Alice", "residence").event_time == "2024-09-02T09:00:00.000000Z"
     assert store.count(entry_type="state") == 1
 
 
@@ -798,14 +837,14 @@ def test_state_chain_and_clusterer_survive_the_split(store):
     chain = StateChain(store, embedder, config)
     early = Entry(entry_type="state", memory="Alice — residence: Hangzhou", subject="Alice",
                   attribute="residence", value="Hangzhou",
-                  float_event_time=iso_to_ts("2024-01-01T00:00:00"),
-                  float_mention_time=iso_to_ts("2024-01-01T00:00:00"))
+                  event_time=iso_to_ts("2024-01-01T00:00:00"),
+                  mention_time=iso_to_ts("2024-01-01T00:00:00"))
     assert chain.handle(early).action == "ADD"
 
     late = Entry(entry_type="state", memory="Alice — residence: Helsinki", subject="Alice",
                  attribute="residence", value="Helsinki",
-                 float_event_time=iso_to_ts("2024-08-01T00:00:00"),
-                 float_mention_time=iso_to_ts("2024-08-01T00:00:00"))
+                 event_time=iso_to_ts("2024-08-01T00:00:00"),
+                 mention_time=iso_to_ts("2024-08-01T00:00:00"))
     assert chain.handle(late).action == "UPDATE"
     assert chain.get_current("Alice", "residence").value == "Helsinki"
     # The superseded row is still in the state collection, flagged not deleted.

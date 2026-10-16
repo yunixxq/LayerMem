@@ -1,18 +1,3 @@
-"""Online incremental topic clustering (LayerMem.md §2.2, semantic axis).
-
-Every new atom is embedded and compared against the atoms already stored *in
-its own perspective*. Whichever topic the nearest neighbour belongs to is the
-topic the new atom joins; below ``theta_cluster`` a fresh topic is created.
-
-Two design points from the design doc drive the implementation:
-
-* Topics are identified by a **stable ID** that atoms carry as a member set —
-  not by a position range — so inserting never cascades an update.
-* Each perspective clusters in its **own** semantic space. Comparing a state
-  atom against factual atoms would merge topics that merely happen to be
-  worded alike.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -29,11 +14,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Assignment:
-    """Where an atom landed, and whether it is a repeat of an existing one."""
+    """Where an atom landed."""
 
     topic_id: str
     is_new_topic: bool
-    duplicate_of: Optional[Entry] = None
     similarity: float = 0.0
 
 
@@ -53,34 +37,60 @@ class Clusterer:
     def embed(self, text: str) -> Sequence[float]:
         return self.embedder.embed(text)
 
-    def assign(self, entry: Entry, vector: Optional[Sequence[float]] = None) -> Assignment:
-        """Decide the topic of ``entry`` (does not write it)."""
+    def assign(
+        self,
+        entry: Entry,
+        vector: Optional[Sequence[float]] = None,
+        layer: Optional[str] = None,
+    ) -> Assignment:
+        """Decide the topic within one independent layer."""
+        layer = layer or entry.layer
         vector = vector if vector is not None else self.embed(entry.memory)
 
         neighbours = self.store.search(
             vector,
             limit=5,
             entry_type=entry.entry_type,
-            layer="L1",
+            layer=layer,
         )
         if not neighbours:
             return Assignment(topic_id=str(uuid.uuid4()), is_new_topic=True)
 
-        best_entry, best_score = neighbours[0]
-        if best_score < self.config.theta_cluster or not best_entry.topic_id:
-            return Assignment(
-                topic_id=str(uuid.uuid4()),
-                is_new_topic=True,
-                similarity=best_score,
+        capacities = {
+            "L1": self.config.K1,
+            "L2": self.config.K2,
+            "L3": self.config.K3,
+            "L4": None,
+        }
+        capacity = capacities.get(layer)
+        # Choose the nearest eligible topic. Each layer has an independent
+        # topic namespace and capacity.
+        for candidate, score in neighbours:
+            if score < self.config.theta_cluster or not candidate.topic_id:
+                continue
+            if capacity is None:
+                return Assignment(
+                    topic_id=candidate.topic_id,
+                    is_new_topic=False,
+                    similarity=score,
+                )
+            members = self.store.scroll(
+                limit=capacity,
+                topic_id=candidate.topic_id,
+                entry_type=entry.entry_type,
+                layer=layer,
             )
+            if len(members) < capacity:
+                return Assignment(
+                    topic_id=candidate.topic_id,
+                    is_new_topic=False,
+                    similarity=score,
+                )
 
-        # A near-identical restatement is not a new memory: count the mention
-        # instead of storing a duplicate row (LayerMem_imple.md §七.9).
-        duplicate = best_entry if best_score >= self.config.theta_dup else None
+        best_score = neighbours[0][1]
         return Assignment(
-            topic_id=best_entry.topic_id,
-            is_new_topic=False,
-            duplicate_of=duplicate,
+            topic_id=str(uuid.uuid4()),
+            is_new_topic=True,
             similarity=best_score,
         )
 
@@ -91,11 +101,11 @@ class Clusterer:
         layer: str = "L1",
         limit: int = 1000,
     ) -> List[Entry]:
-        """All atoms currently in a topic, oldest first."""
+        """All atoms currently in a topic at the requested layer."""
         entries = self.store.scroll(
             limit=limit,
             topic_id=topic_id,
             entry_type=entry_type,
             layer=layer,
         )
-        return sorted(entries, key=lambda e: e.event_key)
+        return entries

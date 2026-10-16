@@ -11,7 +11,7 @@ from layermem.configs.config import EmbedderConfig
 
 class TextEmbedderOpenAI:
     def __init__(self, config: Optional[EmbedderConfig] = None):
-        # See TextEmbedderHuggingface: keep the caller's config untouched.
+        # Keep the caller's config untouched while resolving embedder defaults.
         self.config = (
             dataclasses.replace(config)
             if config is not None
@@ -45,7 +45,9 @@ class TextEmbedderOpenAI:
             if len(text) == 0:
                 return []
             inputs = [preprocess(x) for x in text]
-            resp = self.client.embeddings.create(input=inputs, **api_params)
+            resp = self.client.embeddings.create(
+                input=inputs, encoding_format="float", **api_params
+            )
             self.total_calls += 1
             self.total_tokens += resp.usage.total_tokens
             vectors = [item.embedding for item in resp.data]
@@ -53,7 +55,9 @@ class TextEmbedderOpenAI:
             return vectors
 
         preprocessed = preprocess(text)
-        resp = self.client.embeddings.create(input=[preprocessed], **api_params)
+        resp = self.client.embeddings.create(
+            input=[preprocessed], encoding_format="float", **api_params
+        )
         self.total_calls += 1
         self.total_tokens += resp.usage.total_tokens
         vectors = [item.embedding for item in resp.data]

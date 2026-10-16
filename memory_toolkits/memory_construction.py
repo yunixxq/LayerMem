@@ -1,4 +1,5 @@
 import argparse
+from config_loader import load_memory_config
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -430,7 +431,12 @@ if __name__ == "__main__":
             "(e.g., LoCoMo)."
         )
     )
+    parser.add_argument("--llm-profile", default=None, help="LLM profile from the config; defaults to default_llm_profile.")
     args = parser.parse_args()
+    try:
+        config = load_memory_config(args.config_path, args.llm_profile)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
 
     message_preprocessor = None
     if args.message_preprocessor is not None:
@@ -452,11 +458,6 @@ if __name__ == "__main__":
     # print(dataset) calls the __str__ method defined by Pydantic's BaseModel
     print(repr(dataset))
     print()
-
-    config = None 
-    if args.config_path is not None:
-        with open(args.config_path, 'r', encoding="utf-8") as f:
-            config = json.load(f)
 
     # Get a dummy configuration to infer the corresponding LLM being used 
     # Use lazy mapping to load config class

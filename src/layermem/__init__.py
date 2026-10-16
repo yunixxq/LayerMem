@@ -2,6 +2,6 @@
 
 from .api import LayerMemory
 from .configs import EmbedderConfig, LayerMemConfig, LLMConfig
-from .core import Entry
+from .core import ClusteredEntry, Entry, StateEntry
 
-__all__ = ["EmbedderConfig", "Entry", "LayerMemConfig", "LLMConfig", "LayerMemory"]
+__all__ = ["EmbedderConfig", "ClusteredEntry", "StateEntry", "Entry", "LayerMemConfig", "LLMConfig", "LayerMemory"]

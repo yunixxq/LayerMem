@@ -2,15 +2,11 @@ from typing import Any, Dict, Mapping
 
 from layermem.configs.config import EmbedderConfig
 
-from .huggingface import TextEmbedderHuggingface
 from .openai import TextEmbedderOpenAI
 
 
 class EmbedderFactory:
-    _MODEL_MAPPING = {
-        "huggingface": TextEmbedderHuggingface,
-        "openai": TextEmbedderOpenAI,
-    }
+    _MODEL_MAPPING = {"openai": TextEmbedderOpenAI}
 
     @classmethod
     def from_config(cls, config: EmbedderConfig | Mapping[str, Any] | None = None) -> Any:
@@ -28,7 +24,7 @@ class EmbedderFactory:
             config = EmbedderConfig()
         elif isinstance(config, Mapping):
             values = dict(config)
-            model_name = values.pop("model_name", "huggingface")
+            model_name = values.pop("model_name", "openai")
             nested = values.pop("configs", None)
             if nested is not None:
                 values = {**nested, **values}

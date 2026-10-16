@@ -11,18 +11,24 @@ from layermem.memory.llm.utils import (
     Conversation,
     Message,
     conversation_text,
-    latest_timestamp,
-    normalize_extraction,
+    normalize_factual_relational,
+    normalize_state,
     parse_json_object,
+    parse_json_value,
 )
-from layermem.prompts.extraction import render_extraction_prompt
+from layermem.prompts.extraction import (
+    FACTUAL_RELATIONAL_EXTRACTION_PROMPT,
+    STATE_EXTRACTION_PROMPT,
+)
 
 
 class OpenAILLM:
-    """Extract structured memories through an OpenAI-compatible chat API."""
+    """Extract memories through the OpenAI Responses API."""
 
     def __init__(self, config: Optional[LLMConfig] = None):
         self.config = config or LLMConfig()
+        if self.config.api_type != "responses":
+            raise ValueError(f"Unsupported LLM API type: {self.config.api_type}")
         self.model = self.config.model or "gpt-4o-mini"
         self.total_calls = 0
         self.total_tokens = 0
@@ -47,69 +53,64 @@ class OpenAILLM:
     def generate_response(
         self,
         messages: List[Message],
-        response_format: Optional[Dict[str, str]] = None,
     ) -> tuple[str, Dict[str, int]]:
-        params: Dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-            "top_p": self.config.top_p,
-        }
-        if response_format is not None:
-            params["response_format"] = response_format
+        prompt = "\n\n".join(message.get("content", "") for message in messages)
+        response = self.client.responses.create(model=self.model, input=prompt)
 
-        try:
-            response = self.client.chat.completions.create(**params)
-        except Exception:
-            # Not every OpenAI-compatible server implements JSON mode. The
-            # parser tolerates fenced output, so retry once without it; if the
-            # retry fails its own error surfaces.
-            if response_format is None:
-                raise
-            params.pop("response_format", None)
-            response = self.client.chat.completions.create(**params)
-
+        status = getattr(response, "status", None)
+        if status not in (None, "completed") or getattr(response, "error", None):
+            raise ValueError(f"Responses request did not complete (status={status})")
+        
+        text = response.output_text
+        if not text or not text.strip():
+            raise ValueError("Responses endpoint returned no output text")
         usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "input_tokens", 0) or 0
+        output_tokens = getattr(usage, "output_tokens", 0) or 0
+        total_tokens = getattr(usage, "total_tokens", None)
+        if total_tokens is None:
+            total_tokens = input_tokens + output_tokens
         usage_info = {
-            "prompt_tokens": getattr(usage, "prompt_tokens", 0),
-            "completion_tokens": getattr(usage, "completion_tokens", 0),
-            "total_tokens": getattr(usage, "total_tokens", 0),
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": total_tokens,
         }
         self.total_calls += 1
         self.total_tokens += usage_info["total_tokens"]
-        return response.choices[0].message.content or "", usage_info
+        return text, usage_info
 
     def extract_memories(
         self,
         conversation: Conversation,
-        system_prompt: Optional[str] = None,
-        current_date: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Extract factual, relational, and state memories from raw dialogue.
-
-        ``current_date`` anchors relative time expressions; it defaults to the
-        newest turn timestamp in the conversation.
-        """
-        anchor = current_date or latest_timestamp(conversation)
-        messages = [
-            {
-                "role": "system",
-                "content": system_prompt or render_extraction_prompt(anchor),
-            },
-            {"role": "user", "content": conversation_text(conversation)},
-        ]
-        raw_response, usage = self.generate_response(
-            messages,
-            response_format={"type": "json_object"},
+        """Run independent factual/relational and State extraction passes."""
+        rendered = conversation_text(conversation)
+        factual_raw, factual_usage = self.generate_response(
+            [{
+                "role": "user",
+                "content": FACTUAL_RELATIONAL_EXTRACTION_PROMPT + "\n\n" + rendered,
+            }]
         )
-        # Keep usage and the raw response out of the three memory lists, so
-        # callers can iterate the result without special-casing metadata.
-        result = normalize_extraction(parse_json_object(raw_response))
+        state_raw, state_usage = self.generate_response(
+            [{
+                "role": "user",
+                "content": STATE_EXTRACTION_PROMPT + "\n\n" + rendered,
+            }]
+        )
+        factual_result = normalize_factual_relational(parse_json_object(factual_raw))
+        state_result = normalize_state(parse_json_value(state_raw))
+        result = {
+            "factual": factual_result["factual"],
+            "relational": factual_result["relational"],
+            "state": state_result,
+        }
+        usage = {
+            key: factual_usage.get(key, 0) + state_usage.get(key, 0)
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        }
         result["meta"] = {
             "usage": usage,
-            "raw_response": raw_response,
-            "current_date": anchor,
+            "calls": 2,
         }
         return result
 

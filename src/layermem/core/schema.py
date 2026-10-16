@@ -3,97 +3,101 @@ from __future__ import annotations
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, TypeAlias, Union
 
-# The three heterogeneous perspectives of LayerMem.md §2.1.
 ENTRY_TYPES = ("factual", "relational", "state")
-# The hierarchical compression levels of LayerMem.md §2.2.
 LAYERS = ("L1", "L2", "L3", "L4")
 
 
+def normalize_time(value: str | float | int | datetime | None) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        parsed = datetime.fromtimestamp(value, tz=timezone.utc)
+    else:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 def now_ts() -> float:
-    """Current wall-clock time as a unix timestamp."""
     return datetime.now(tz=timezone.utc).timestamp()
 
 
-def iso_to_ts(value: Optional[str]) -> Optional[float]:
-    """Parse an ISO-8601 string into a unix timestamp.
+def now_iso() -> str:
+    return normalize_time(datetime.now(tz=timezone.utc))
 
-    Returns ``None`` for missing or unparsable input rather than raising:
-    a memory with a broken timestamp must still be storable, it just cannot
-    participate in ordering.
-    """
-    if not value:
-        return None
-    text = str(value).strip().replace("Z", "+00:00")
+
+def iso_to_ts(value: str | float | None) -> Optional[float]:
     try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
+        text = normalize_time(value)
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() if text else None
+    except (ValueError, OverflowError, OSError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.timestamp()
 
 
-def ts_to_iso(value: Optional[float]) -> Optional[str]:
-    if value is None:
-        return None
-    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat(timespec="seconds")
+def ts_to_iso(value: str | float | None) -> Optional[str]:
+    return normalize_time(value)
 
 
 @dataclass
-class Entry:
-    """A single memory item."""
-
-    # --- identity ---
+class ClusteredEntry:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    entry_type: str = "factual"          # factual | relational | state
-    layer: str = "L1"                    # L1 | L2 | L3 | L4
-
-    # --- content ---
+    entry_type: str = "factual"
+    layer: str = "L1"
     memory: str = ""
-
-    # --- double timestamps (LayerMem.md §2.2 note 2) ---
-    float_mention_time: float = field(default_factory=now_ts)
-    float_event_time: Optional[float] = None
-
-    # --- semantic-axis membership ---
     topic_id: Optional[str] = None
 
-    # --- state-chain fields ---
-    subject: Optional[str] = None
-    attribute: Optional[str] = None
-    value: Optional[str] = None
-    status: Optional[str] = None         # current | superseded
-
-    # --- bookkeeping ---
-    mention_count: int = 1
-    source_dialog_ids: List[str] = field(default_factory=list)
-    # Watermark for the compression trigger (LayerMem_imple.md §七.2). Only
-    # meaningful on topic nodes; absent elsewhere.
-    compressed_until: Optional[float] = None
-    updated_at: float = field(default_factory=now_ts)
-
     def __post_init__(self) -> None:
-        if self.entry_type not in ENTRY_TYPES:
-            raise ValueError(f"Unknown entry_type {self.entry_type!r}; expected one of {ENTRY_TYPES}")
+        if self.entry_type not in ("factual", "relational"):
+            raise ValueError(f"ClusteredEntry cannot have type {self.entry_type!r}")
         if self.layer not in LAYERS:
             raise ValueError(f"Unknown layer {self.layer!r}; expected one of {LAYERS}")
 
-    @property
-    def event_key(self) -> float:
-        """Sort key for every temporal operation.
-
-        ``float_event_time`` is optional, so ordering falls back to the
-        mention time. Never compare the raw ``float_event_time``.
-        """
-        return self.float_event_time if self.float_event_time is not None else self.float_mention_time
-
     def payload(self) -> Dict[str, Any]:
-        """Payload stored in Qdrant (the vector itself is kept separately)."""
         return {k: v for k, v in asdict(self).items() if v not in (None, [], "")}
 
-    @classmethod
-    def from_payload(cls, payload: Dict[str, Any]) -> "Entry":
-        known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in payload.items() if k in known})
+
+@dataclass
+class StateEntry:
+    """A version in a subject/attribute state chain."""
+
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    entry_type: str = "state"
+    memory: str = ""
+    mention_time: str = field(default_factory=now_iso)
+    event_time: Optional[str] = None
+    subject: str = ""
+    attribute: str = ""
+    value: str = ""
+
+    def __post_init__(self) -> None:
+        if self.entry_type != "state":
+            raise ValueError(f"StateEntry must have type 'state', got {self.entry_type!r}")
+        self.mention_time = normalize_time(self.mention_time)
+        self.event_time = normalize_time(self.event_time) or self.mention_time
+        if self.mention_time is None:
+            raise ValueError("mention_time is required")
+
+    @property
+    def event_key(self) -> str:
+        return self.event_time or self.mention_time
+
+    def payload(self) -> Dict[str, Any]:
+        return {k: v for k, v in asdict(self).items() if v not in (None, [], "")}
+
+
+Entry: TypeAlias = Union[ClusteredEntry, StateEntry]
+
+
+def entry_from_payload(payload: Dict[str, Any]) -> Entry:
+    payload = dict(payload)
+    payload["id"] = str(payload.get("id"))
+    if payload.get("entry_type") == "state":
+        fields = {f.name for f in StateEntry.__dataclass_fields__.values()}
+        return StateEntry(**{k: v for k, v in payload.items() if k in fields})
+    fields = {f.name for f in ClusteredEntry.__dataclass_fields__.values()}
+    return ClusteredEntry(**{k: v for k, v in payload.items() if k in fields})

@@ -4,6 +4,7 @@ from inference_utils.operators import (
     LLMExactMatch,
 )
 from memories import DATASET_MAPPING
+from config_loader import load_memory_config
 import numpy as np
 import argparse
 import json 
@@ -221,11 +222,29 @@ if __name__ == "__main__":
         required=True,
         help="The type of dataset (e.g., LoCoMo, LongMemEval)."
     )
+    parser.add_argument("--config-path", default=None, help="Memory config; selects QA and judge model together.")
+    parser.add_argument("--llm-profile", default=None, help="LLM profile for QA and judging.")
     args = parser.parse_args()
 
     # Prepare interface kwargs
     interface_kwargs: Dict[str, Any] = {}
-    if args.api_config_path is not None:
+    if args.config_path is not None or args.llm_profile is not None:
+        if args.api_config_path is not None:
+            parser.error("Use --config-path or --api-config-path, not both")
+        try:
+            config = load_memory_config(args.config_path, args.llm_profile)
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        if not config or not config.get("llm_model"):
+            parser.error("The selected config must define llm_model")
+        args.qa_model = args.judge_model = config["llm_model"]
+        api_key = config.get("llm_api_key") or os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            parser.error("Set OPENAI_API_KEY or llm_api_key for the selected profile")
+        interface_kwargs["api_keys"] = [api_key]
+        interface_kwargs["base_urls"] = [config.get("llm_base_url") or os.environ.get("OPENAI_API_BASE") or os.environ.get("OPENAI_BASE_URL")]
+        interface_kwargs["api_type"] = config.get("llm_api_type", "responses")
+    elif args.api_config_path is not None:
         with open(args.api_config_path, 'r') as f:
             api_config = json.load(f)
         interface_kwargs["api_keys"] = api_config["api_keys"]

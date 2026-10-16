@@ -6,8 +6,8 @@ Two departures from the usual "classify query difficulty" router:
   LayerMem_imple.md §三 argues that the L1-L4 abstraction axis already lives
   in the embedding space, so the ANN distance performs granularity alignment
   for free; a router that guesses at difficulty only adds a way to be wrong.
-* It resolves ``time_ref`` into an absolute timestamp here, because the state
-  chain needs a number, not the phrase "last year".
+* The planner supplies absolute bounds and a query type for predefined SQL.
+  Legacy ``time_ref`` plans can still be resolved into an as-of timestamp.
 
 The planner is best-effort: if the model returns junk, the router falls back
 to querying every track with the query itself as the only keyword.
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional
 
-from layermem.core.schema import iso_to_ts
+from layermem.core.schema import iso_to_ts, normalize_time
 from layermem.prompts.retrieval import render_planner_prompt
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,9 @@ class RetrievalPlan:
     state_attr: Optional[str] = None
     time_ref: Optional[str] = None
     target_ts: Optional[float] = None
+    query_type: str = "current"
+    time_lower: Optional[str] = None
+    time_upper: Optional[str] = None
 
     @property
     def wants_state(self) -> bool:
@@ -56,18 +59,21 @@ class RetrievalRouter:
     def __init__(self, llm: Any) -> None:
         self.llm = llm
 
-    def plan(self, query: str, now: Optional[float] = None) -> RetrievalPlan:
-        now = now or datetime.now(tz=timezone.utc).timestamp()
+    def plan(
+        self, query: str, now: Optional[float] = None,
+        state_attributes: Optional[List[dict]] = None,
+    ) -> RetrievalPlan:
+        now = now if now is not None else datetime.now(tz=timezone.utc).timestamp()
         try:
             text, _ = self.llm.generate_response(
-                [{"role": "user", "content": render_planner_prompt(query)}]
+                [{"role": "user", "content": render_planner_prompt(query, now, state_attributes)}]
             )
             payload = _extract_json(text)
+            plan = _to_plan(payload, query)
         except Exception as exc:  # pragma: no cover - provider dependent
             logger.warning("retrieval planner failed (%s); querying all tracks", exc)
-            payload = {}
+            plan = _to_plan({}, query)
 
-        plan = _to_plan(payload, query)
         plan.target_ts = resolve_time_reference(plan.time_ref, now)
         return plan
 
@@ -116,19 +122,29 @@ def _to_plan(payload: dict, query: str) -> RetrievalPlan:
         return value
 
     subject = text_or_none(payload.get("subject"))
-    state_attr = text_or_none(payload.get("state_attr"))
+    state_attr = text_or_none(payload.get("attribute", payload.get("state_attr")))
     # A model that filled in state_attr clearly intends a state lookup even
     # when it forgot to list "state" in tracks; honour the stronger signal
     # rather than dropping the track.
     if state_attr and "state" not in tracks:
         tracks = [*tracks, "state"]
 
+    query_type = payload.get("query_type") or "current"
+    if query_type not in ("current", "range", "all"):
+        raise ValueError(f"Unknown state query_type: {query_type!r}")
+    lower = normalize_time(text_or_none(payload.get("time_lower")))
+    upper = normalize_time(text_or_none(payload.get("time_upper")))
+    if lower is not None and upper is not None and lower > upper:
+        raise ValueError("time_lower must not be later than time_upper")
     return RetrievalPlan(
         tracks=tracks,
         keywords=keywords,
         subject=subject,
         state_attr=state_attr,
         time_ref=text_or_none(payload.get("time_ref")),
+        query_type=query_type,
+        time_lower=lower,
+        time_upper=upper,
     )
 
 

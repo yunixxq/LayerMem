@@ -1,5 +1,7 @@
 import argparse
+from config_loader import load_memory_config
 import json
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import threading
@@ -28,6 +30,7 @@ def memory_search(
     top_k: int = 10,
     strict: bool = True, 
     dataset: Optional[MemoryDataset] = None,
+    query_time: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Search memories for a given user based on questions."""
     config = config or {}
@@ -84,7 +87,17 @@ def memory_search(
     for qa_pair in pbar:
         query = qa_pair.question
         # Perform retrieval using the unified interface
-        retrieved_memories = layer.retrieve(query, k=top_k)
+        # LayerMem uses this as the anchor for relative time references in
+        # state queries. Other baselines do not expose this argument, so keep
+        # their retrieval interfaces unchanged.
+        if layer_type == "LayerMem":
+            retrieved_memories = layer.retrieve(
+                query,
+                k=top_k,
+                query_time=query_time,
+            )
+        else:
+            retrieved_memories = layer.retrieve(query, k=top_k)
         # MemZeroGraph return a dict with "memories" and "relations"
         retrieval_result = {
             "retrieved_memories": retrieved_memories,
@@ -167,7 +180,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to raise an error if no memory is found for a user."
     )
+    parser.add_argument("--llm-profile", default=None, help="LLM profile from the config; defaults to default_llm_profile.")
+    parser.add_argument("--output-path", default=None, help="Explicit retrieval results path.")
     args = parser.parse_args()
+    try:
+        config = load_memory_config(args.config_path, args.llm_profile)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     
     # Prepare the dataset using lazy mapping
     ds_cls = DATASET_MAPPING[args.dataset_type]
@@ -177,10 +196,6 @@ if __name__ == "__main__":
     print("The dataset is loaded successfully.")
     
     # Load configuration
-    config = None
-    if args.config_path is not None:
-        with open(args.config_path, 'r', encoding="utf-8") as f:
-            config = json.load(f)
     
     llm_model = config["llm_model"]
     # Process index range
@@ -199,6 +214,11 @@ if __name__ == "__main__":
         futures = []
         for trajectory, qa_pairs in zip(*dataset[args.start_idx: args.end_idx]):
             user_id = f"user_{dataset.__class__.__name__}_{trajectory.metadata['id']}"
+            non_empty_sessions = [session for session in trajectory.sessions if len(session) > 0]
+            query_time = max(
+                (session.timestamp for session in non_empty_sessions),
+                default=None,
+            )
             future = executor.submit(
                 memory_search,
                 args.memory_type,
@@ -208,6 +228,7 @@ if __name__ == "__main__":
                 top_k=args.top_k,
                 strict=args.strict,
                 dataset=dataset,
+                query_time=query_time,
             )
             futures.append(future)
         for future in tqdm(
@@ -218,7 +239,8 @@ if __name__ == "__main__":
 
     for item in retrievals:
         item["qa_pair"] = item["qa_pair"].model_dump()
-    output_path = f"{args.memory_type}_{llm_model}_{args.dataset_type}_{args.top_k}_{args.start_idx}_{args.end_idx}.json"
+    output_path = args.output_path or f"{args.memory_type}_{llm_model}_{args.dataset_type}_{args.top_k}_{args.start_idx}_{args.end_idx}.json"
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, 'w', encoding="utf-8") as f:
         json.dump(

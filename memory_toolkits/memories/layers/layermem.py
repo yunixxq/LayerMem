@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -15,20 +15,21 @@ class LayerMemConfig(BaseModel):
     user_id: str = Field(..., description="The user id of the memory system.")
     save_dir: str = Field(
         default="vector_store/layermem",
-        description="Directory holding the Qdrant store for this user.",
+        description="Directory holding Qdrant and SQLite memory stores for this user.",
     )
 
     retriever_name_or_path: str = Field(
-        default="sentence-transformers/all-MiniLM-L6-v2",
-        description="Embedding model name or local path.",
+        default="text-embedding-3-small",
+        description="OpenAI embedding model name.",
     )
-    embedding_model_dims: int = Field(default=384, description="Embedding dimension.")
+    embedding_model_dims: int = Field(default=1536, description="Embedding dimension.")
     use_gpu: str = Field(default="cpu", description="Unused; kept for config parity.")
 
     llm_backend: str = Field(
         default="openai",
-        description="'openai' for any OpenAI-compatible endpoint, 'transformers' for a local HF model.",
+        description="'openai' for local or remote API endpoints.",
     )
+    llm_api_type: Literal["responses"] = "responses"
     llm_model: str = Field(default="gpt-4o-mini", description="LLM model name or path.")
     llm_base_url: Optional[str] = Field(default=None, description="OpenAI-compatible base URL.")
     llm_api_key: Optional[str] = Field(default=None, description="API key (any string works for a local server).")
@@ -41,10 +42,13 @@ class LayerMemConfig(BaseModel):
     theta_cluster: float = Field(default=0.75)
     theta_dup: float = Field(default=0.92)
     theta_confirm: float = Field(default=0.90)
+    state_attribute_high: float = Field(default=0.90)
+    state_attribute_low: float = Field(default=0.75)
+    state_attribute_top_k: int = Field(default=5)
     theta_retrieval: float = Field(default=0.6)
-    K1: int = Field(default=5)
-    K2: int = Field(default=5)
-    K3: int = Field(default=3)
+    K1: int = Field(default=10)
+    K2: int = Field(default=7)
+    K3: int = Field(default=5)
     top_k: int = Field(default=10)
     collection_name: Optional[str] = Field(default=None)
     on_disk: bool = Field(default=True)
@@ -62,12 +66,15 @@ class LayerMemLayer(BaseMemoryLayer):
 
         core = CoreConfig(
             embedder=EmbedderConfig(
-                model_name="huggingface",
+                model_name="openai",
                 model=config.retriever_name_or_path,
                 embedding_dims=config.embedding_model_dims,
+                base_url=config.llm_base_url,
+                api_key=config.llm_api_key,
             ),
             llm=LLMConfig(
                 model_name=config.llm_backend,
+                api_type=config.llm_api_type,
                 model=config.llm_model,
                 base_url=config.llm_base_url,
                 api_key=config.llm_api_key,
@@ -79,6 +86,9 @@ class LayerMemLayer(BaseMemoryLayer):
             theta_cluster=config.theta_cluster,
             theta_dup=config.theta_dup,
             theta_confirm=config.theta_confirm,
+            state_attribute_high=config.state_attribute_high,
+            state_attribute_low=config.state_attribute_low,
+            state_attribute_top_k=config.state_attribute_top_k,
             theta_retrieval=config.theta_retrieval,
             K1=config.K1,
             K2=config.K2,
@@ -117,12 +127,16 @@ class LayerMemLayer(BaseMemoryLayer):
         logger.info("memory stats: %s", self.memory.stats())
 
     def load_memory(self, user_id: Optional[str] = None) -> bool:
-        return self.memory.store.count() > 0
+        return self.memory.store.count() + self.memory.state_chain.count() > 0
 
     def retrieve(
         self, query: str, k: int = 10, **kwargs
     ) -> List[Dict[str, Union[str, Dict[str, Any]]]]:
-        memories = self.memory.retrieve(query, k=k)
+        memories = self.memory.retrieve(
+            query,
+            k=k,
+            query_time=kwargs.get("query_time"),
+        )
         outputs: List[Dict[str, Union[str, Dict[str, Any]]]] = []
         for text in memories:
             outputs.append(
@@ -136,16 +150,14 @@ class LayerMemLayer(BaseMemoryLayer):
 
     def delete(self, memory_id: str) -> bool:
         try:
-            self.memory.store.delete([memory_id])
-            return True
+            return self.memory.delete(memory_id)
         except Exception as exc:
             logger.warning("delete failed for %s: %s", memory_id, exc)
             return False
 
     def update(self, memory_id: str, **kwargs) -> bool:
         try:
-            self.memory.store.update_payload(memory_id, dict(kwargs))
-            return True
+            return self.memory.update(memory_id, dict(kwargs))
         except Exception as exc:
             logger.warning("update failed for %s: %s", memory_id, exc)
             return False

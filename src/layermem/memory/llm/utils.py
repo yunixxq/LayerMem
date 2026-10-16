@@ -2,8 +2,8 @@
 
 import json
 import re
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Union
 
 Message = Dict[str, Any]
 Conversation = Union[str, List[Message]]
@@ -24,12 +24,9 @@ def _turn_timestamp(message: Message) -> str:
         if value is None or value == "":
             continue
         if isinstance(value, (int, float)):
-            # Rendered in the host's local timezone, so "yesterday" resolves
-            # against the user's wall clock. Benchmark fixtures should carry
-            # ISO strings instead if they need to be reproducible across
-            # machines.
+            # Unix timestamps are absolute instants; never use the host timezone.
             try:
-                return datetime.fromtimestamp(float(value)).isoformat(timespec="seconds")
+                return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat(timespec="seconds")
             except (OverflowError, OSError, ValueError):
                 continue
         text = str(value).strip()
@@ -57,30 +54,18 @@ def conversation_text(conversation: Conversation) -> str:
         return conversation
 
     lines: List[str] = []
-    for message in conversation:
+    for index, message in enumerate(conversation, 1):
         content = message.get("content", "")
         if not content:
             continue
         timestamp = _turn_timestamp(message)
         prefix = f"[{timestamp}] " if timestamp else ""
-        lines.append(f"{prefix}{_turn_speaker(message)}: {content}")
+        lines.append(f"[message {index}] {prefix}{_turn_speaker(message)}: {content}")
     return "\n".join(lines)
 
 
-def latest_timestamp(conversation: Conversation) -> Optional[str]:
-    """Return the newest turn timestamp, used as the "today" anchor."""
-    if isinstance(conversation, str):
-        return None
-    timestamps = [ts for ts in (_turn_timestamp(m) for m in conversation) if ts]
-    return timestamps[-1] if timestamps else None
-
-
 def parse_json_object(response_text: str) -> Dict[str, Any]:
-    """Parse a JSON object out of a raw model response.
-
-    Tolerates markdown fences and surrounding prose, both of which show up
-    with providers that do not honour ``response_format``.
-    """
+    """Parse a JSON object out of a raw model response. """
     text = (response_text or "").strip()
     match = _FENCE_RE.search(text)
     if match:
@@ -96,18 +81,72 @@ def parse_json_object(response_text: str) -> Dict[str, Any]:
     return parsed
 
 
-def normalize_extraction(result: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+def parse_json_value(response_text: str) -> Any:
+    """Parse a JSON object or array from a provider response."""
+    text = (response_text or "").strip()
+    match = _FENCE_RE.search(text)
+    if match:
+        text = match.group(1).strip()
+    starts = [index for index in (text.find("{"), text.find("[")) if index >= 0]
+    if not starts:
+        raise ValueError("The extraction response does not contain a JSON value.")
+    start = min(starts)
+    end = max(text.rfind("}"), text.rfind("]"))
+    if end <= start:
+        raise ValueError("The extraction response contains incomplete JSON.")
+    return json.loads(text[start : end + 1])
+
+
+def normalize_extraction(result: Dict[str, Any]) -> Dict[str, List[Any]]:
     """Coerce a parsed response into the three top-level memory lists.
 
-    Missing categories become empty lists and non-dict entries are dropped, so
-    one malformed item does not discard the whole batch.
+    Missing categories become empty lists. Factual and relational strings are
+    valid prompt outputs and must be preserved for the downstream Extractor;
+    malformed scalar values are dropped, so one bad item does not discard the
+    whole batch.
     """
-    normalized: Dict[str, List[Dict[str, Any]]] = {}
+    normalized: Dict[str, List[Any]] = {}
     for key in EXTRACTION_KEYS:
         value = result.get(key, [])
         if value is None:
             value = []
         if not isinstance(value, list):
             raise ValueError(f"Extraction field '{key}' must be a list.")
-        normalized[key] = [item for item in value if isinstance(item, dict)]
+        if key in ("factual", "relational"):
+            normalized[key] = [
+                item for item in value
+                if isinstance(item, (str, dict))
+            ]
+        else:
+            normalized[key] = [item for item in value if isinstance(item, dict)]
     return normalized
+
+
+def normalize_factual_relational(result: Dict[str, Any]) -> Dict[str, List[Any]]:
+    """Normalize the response from the factual/relational extraction pass."""
+    normalized: Dict[str, List[Any]] = {}
+    for key in ("factual", "relational"):
+        value = result.get(key, [])
+        if value is None:
+            value = []
+        if not isinstance(value, list):
+            raise ValueError(f"Extraction field '{key}' must be a list.")
+        normalized[key] = [
+            item for item in value if isinstance(item, (str, dict))
+        ]
+    return normalized
+
+
+def normalize_state(result: Any) -> List[Dict[str, Any]]:
+    """Normalize the response from the independent State extraction pass."""
+    if isinstance(result, dict):
+        value = result.get("state", [])
+    elif isinstance(result, list):
+        value = result
+    else:
+        raise ValueError("State extraction response must be an object or list.")
+    if value is None:
+        value = []
+    if not isinstance(value, list):
+        raise ValueError("Extraction field 'state' must be a list.")
+    return [item for item in value if isinstance(item, dict)]

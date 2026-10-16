@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from layermem.compression.layer import LayerCompressor
 from layermem.configs.config import LayerMemConfig
-from layermem.core.schema import Entry
+from layermem.core.schema import Entry, StateEntry, iso_to_ts
 from layermem.memory.embedder import EmbedderFactory
 from layermem.memory.llm import LLMFactory
 from layermem.pipeline.buffer import DialogBuffer, Message
@@ -48,9 +48,17 @@ class LayerMemory:
         self.normalizer = Normalizer()
         self.extractor = Extractor(self.llm, self.config)
         self.clusterer = Clusterer(self.store, self.embedder, self.config)
-        self.state_chain = StateChain(self.store, self.embedder, self.config)
+        self.state_chain = StateChain(self.store, self.embedder, self.config, llm=self.llm)
+        imported = self.state_chain.migrate_legacy()
+        if imported:
+            logger.info("imported %d legacy State nodes into SQLite", imported)
         self.compressor = LayerCompressor(
-            self.store, self.embedder, self.llm, self.state_chain, self.config
+            self.store,
+            self.embedder,
+            self.llm,
+            None,
+            self.config,
+            clusterer=self.clusterer,
         )
         self.router = RetrievalRouter(self.llm)
         self.retriever = Retriever(self.store, self.embedder, self.state_chain, self.config)
@@ -83,63 +91,73 @@ class LayerMemory:
         vector = self.clusterer.embed(entry.memory)
         assignment = self.clusterer.assign(entry, vector)
 
-        if assignment.duplicate_of is not None:
-            # A restatement, not a new memory: bump the count and move on.
-            existing = assignment.duplicate_of
-            self.store.update_payload(
-                existing.id,
-                {
-                    "mention_count": existing.mention_count + 1,
-                    "float_mention_time": max(existing.float_mention_time, entry.float_mention_time),
-                },
-                entry_type=entry.entry_type,
-            )
-            return
-
         entry.topic_id = assignment.topic_id
         self.store.upsert(entry, vector)
         self.compressor.on_write(assignment.topic_id, entry.entry_type)
 
-    def _write_state(self, entry: Entry) -> None:
+    def _write_state(self, entry: StateEntry) -> None:
         entry.subject = self.normalizer.subject(entry.subject)
-        entry.attribute = self.normalizer.attribute(entry.attribute)
         if not (entry.subject and entry.attribute and entry.value):
             return
-        entry.memory = f"{entry.subject} — {entry.attribute}: {entry.value}"
         self.state_chain.handle(entry)
 
-    def retrieve(self, query: str, k: Optional[int] = None) -> List[str]:
+    def retrieve(
+        self,
+        query: str,
+        k: Optional[int] = None,
+        query_time: Optional[str | float] = None,
+    ) -> List[str]:
         """Return the memory texts that should be handed to the answer model."""
-        plan = self.router.plan(query)
+        # LoCoMo has no question timestamp. Its caller supplies the last
+        # non-empty session timestamp as the query-time anchor so relative
+        # references such as "last year" are resolved against the dataset,
+        # rather than the wall clock of the machine running evaluation.
+        anchor = iso_to_ts(query_time) if query_time is not None else None
+        plan = self.router.plan(query, now=anchor, state_attributes=self.state_chain.nodes.attributes())
         result = self.retriever.retrieve(query, plan, k=k)
         logger.debug("retrieved tracks=%s n=%d", result.tracks_used, len(result.memories))
         return result.memories
 
-    def retrieve_detailed(self, query: str, k: Optional[int] = None) -> RetrievalResult:
-        plan = self.router.plan(query)
+    def retrieve_detailed(
+        self,
+        query: str,
+        k: Optional[int] = None,
+        query_time: Optional[str | float] = None,
+    ) -> RetrievalResult:
+        anchor = iso_to_ts(query_time) if query_time is not None else None
+        plan = self.router.plan(query, now=anchor, state_attributes=self.state_chain.nodes.attributes())
         return self.retriever.retrieve(query, plan, k=k)
 
-    def compact(self) -> Dict[str, int]:
-        """Merge redundant summaries. Safe to run between sessions."""
-        return self.compressor.compact()
-
     def close(self) -> None:
+        self.state_chain.close()
         self.store.close()
+
+    def delete(self, entry_id: str) -> bool:
+        if self.state_chain.nodes.delete(entry_id):
+            return True
+        if self.store.get_by_id(entry_id) is None:
+            return False
+        self.store.delete([entry_id])
+        return True
+
+    def update(self, entry_id: str, patch: Dict[str, Any]) -> bool:
+        if self.state_chain.update(entry_id, patch):
+            return True
+        return self.store.update_payload(entry_id, patch)
 
     def stats(self) -> Dict[str, Any]:
         layers = {
             layer: self.store.count(layer=layer)
             for layer in ("L1", "L2", "L3", "L4")
         }
+        state_count = self.state_chain.count()
+        by_type = {t: self.store.count(entry_type=t) for t in ("factual", "relational")}
+        by_type["state"] = state_count
         return {
-            "total": self.store.count(),
+            "total": sum(by_type.values()),
             "by_layer": layers,
-            "by_type": {
-                t: self.store.count(entry_type=t)
-                for t in ("factual", "relational", "state")
-            },
-            "state_current": self.store.count(entry_type="state", status="current"),
-            "state_superseded": self.store.count(entry_type="state", status="superseded"),
+            "by_type": by_type,
+            "state_entries": state_count,
             "embedder": self.embedder.get_stats(),
             "llm": self.llm.get_stats() if hasattr(self.llm, "get_stats") else {},
         }

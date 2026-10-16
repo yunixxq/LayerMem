@@ -1,23 +1,20 @@
 """Central prompt definitions for the LayerMem pipeline."""
 
 from .compression import (
-    L2_MERGE_PROMPT,
-    L2_TOPIC_SUMMARY_PROMPT,
-    L3_STAGE_PORTRAIT_PROMPT,
-    L4_MERGE_PROMPT,
-    L4_PROFILE_PROMPT,
+    FACTUAL_L2_PROMPT, FACTUAL_L3_PROMPT, FACTUAL_L4_PROMPT,
+    RELATIONAL_L2_PROMPT, RELATIONAL_L3_PROMPT, RELATIONAL_L4_PROMPT,
 )
-from .extraction import EXTRACTION_PROMPT, render_extraction_prompt
+from .extraction import (
+    FACTUAL_RELATIONAL_EXTRACTION_PROMPT,
+    STATE_EXTRACTION_PROMPT,
+)
 from .retrieval import RETRIEVAL_PLANNER_PROMPT, render_planner_prompt
 
 __all__ = [
-    "EXTRACTION_PROMPT",
-    "L2_MERGE_PROMPT",
-    "L2_TOPIC_SUMMARY_PROMPT",
-    "L3_STAGE_PORTRAIT_PROMPT",
-    "L4_MERGE_PROMPT",
-    "L4_PROFILE_PROMPT",
+    "FACTUAL_RELATIONAL_EXTRACTION_PROMPT",
+    "STATE_EXTRACTION_PROMPT",
+    "FACTUAL_L2_PROMPT", "FACTUAL_L3_PROMPT", "FACTUAL_L4_PROMPT",
+    "RELATIONAL_L2_PROMPT", "RELATIONAL_L3_PROMPT", "RELATIONAL_L4_PROMPT",
     "RETRIEVAL_PLANNER_PROMPT",
-    "render_extraction_prompt",
     "render_planner_prompt",
 ]
